@@ -1,13 +1,13 @@
-"use strict";
-
 /**
  * enb-transform-flow
  * ==================
- * 
+ *
  * Позволяет преобразовать исходный код с помощью произвольного набора преобразователей
  *
+ * Для работы необходима версия ENB с реализацией file-cache: enb/enb#c77c5208b132ddec14e30c0c6da63c4b0a41316f
+ *
  * **Опции**
- * 
+ *
  * * *String* **target** - Результирующий таргет. По умолчанию - ?.transform
  * * *String* **sourceSuffixes** - Набор расширений файлов для перобразования.
  * * *Function[] | Function* **transformators** - Набор преобразователей исходного кода
@@ -36,7 +36,7 @@
  *                         var queue = params.queue;
  *
  *                         var compilerFilename = require('path').resolve(__dirname, './worker-tasks/babel-transformator');
- *                         return queue.push(compilerFilename, code, { 
+ *                         return queue.push(compilerFilename, code, {
  *                             externalHelpers: 'var',
  *                             ast: false,
  *                             blacklist: ['useStrict']
@@ -66,89 +66,95 @@
  * } ]
  */
 
+const FileCache = require('enb/lib/cache/file-cache');
+const path = require('path');
+
 module.exports = require('enb/lib/build-flow').create()
-		.name('transform-flow')
-		.target('target', '?')
-		.defineRequiredOption('target')
-		.defineRequiredOption('sourceSuffixes')
-		.defineRequiredOption('transformators')
-		.defineOption('reducer')
-		.useFileList([''])
-		.builder(function (files) {
-			var _this = this;
-			var _ = require('lodash');
-			var vow = require('vow');
-			var vowFs = require('vow-fs');
-			var sharedResources = this.node.getSharedResources();
-			var fileCache = sharedResources.fileCache;
-			var jobQueue = sharedResources.jobQueue;
-			var EOL = require('os').EOL;
-			var Buffer = require('buffer').Buffer;
-			var target = this.node.resolvePath(this._target);
+	.name('transform-flow')
+	.target('target', '?')
+	.defineRequiredOption('target')
+	.defineRequiredOption('sourceSuffixes')
+	.defineRequiredOption('transformators')
+	.defineOption('reducer')
+	.useFileList([''])
+	.builder(function (files) {
+		var _this = this;
+		var _ = require('lodash');
+		var vow = require('vow');
+		var vowFs = require('vow-fs');
+		var sharedResources = this.node.getSharedResources();
 
-			// Обрабатываем каждый исходный файл
-			return vow.all(files.map(function (file) {
+		if (!sharedResources.fileCache) {
+			sharedResources.fileCache = new FileCache({ tmpDir: path.resolve(__dirname, '../../../.enb/tmp/') });
+		}
 
-				// Загружаем данные из кэша
-				return fileCache.get(file.fullname, file.mtime).then(function (codeFromCache) {
+		var fileCache = sharedResources.fileCache;
+		var jobQueue = sharedResources.jobQueue;
+		var EOL = require('os').EOL;
+		var Buffer = require('buffer').Buffer;
+		var target = this.node.resolvePath(this._target);
 
-					// Если кэш пуст, то читаем исходный файл
-					if (codeFromCache === null) {
-						return vowFs.read(file.fullname).then(function (codeFromFile) {
-							// Явно приводим трансформаторы к массиву
-							var transformators = [].concat(_this._transformators);
+		// Обрабатываем каждый исходный файл
+		return vow.all(files.map(function (file) {
 
-							// Так как, трансформаторы могут быть промисами, то работаем через промисы
-							var firstPromise = vow.resolve({
-								code: codeFromFile
+			// Загружаем данные из кэша
+			return fileCache.get(file.fullname, file.mtime).then(function (codeFromCache) {
+				// Если кэш пуст, то читаем исходный файл
+				if (codeFromCache === null) {
+					return vowFs.read(file.fullname).then(function (codeFromFile) {
+						// Явно приводим трансформаторы к массиву
+						var transformators = [].concat(_this._transformators);
+
+						// Так как, трансформаторы могут быть промисами, то работаем через промисы
+						var firstPromise = vow.resolve({
+							code: codeFromFile
+						});
+
+						// Запускаем последовательое преоброазоваение каждым трансформатором
+						var resultPromise = _.reduce(transformators, function (promise, transformator) {
+							return promise.then(function (result) {
+								var code = result.code;
+								if (Buffer.isBuffer(code)) {
+									code = code.toString();
+								}
+
+								return transformator({
+									code: code,
+									data: result.data,
+									queue: jobQueue,
+									filename: file.fullname
+								});
 							});
+						}, firstPromise);
 
-							// Запускаем последовательое преоброазоваение каждым трансформатором
-							var resultPromise = _.reduce(transformators, function (promise, transformator) {
-								return promise.then(function (result) {
-									var code = result.code;
-									if (Buffer.isBuffer(code)) {
-										code = code.toString();
-									}
-
-									return transformator({
-										code: code,
-										data: result.data,
-										queue: jobQueue,
-										filename: file.fullname
-									});
-								});
-							}, firstPromise);
-
-							// После выполнения всех трансформаций кладем результат в кэш
-							return resultPromise.then(function (result) {
-								var dataToCache = JSON.stringify(result);
-
-								return fileCache.put(file.fullname, dataToCache).then(function () {
-									result.filename = file.fullname;
-									return result;
-								});
+						// После выполнения всех трансформаций кладем результат в кэш
+						return resultPromise.then(function (result) {
+							var dataToCache = JSON.stringify(result);
+							return fileCache.put(file.fullname, dataToCache).then(function () {
+								result.filename = file.fullname;
+								return result;
 							});
 						});
-					}
-
-					// Из кэша приходит строка, которую нужно преобразовать в объект
-					codeFromCache = JSON.parse(codeFromCache);
-
-					codeFromCache.filename = file.fullname;
-					return codeFromCache;
-				});
-			})).then(function (res) {
-				// Если передана функция обработки результата, то используем ее
-				if (_this._reducer) {
-					return _this._reducer({
-						result: res,
-						target: target
 					});
 				}
 
-				// Иначе, просто сливаем код
-				return _.map(res, 'code').join(EOL);
+				// Из кэша приходит строка, которую нужно преобразовать в объект
+				codeFromCache = JSON.parse(codeFromCache);
+
+				codeFromCache.filename = file.fullname;
+				return codeFromCache;
 			});
-		})
-		.createTech();
+		})).then(function (res) {
+			// Если передана функция обработки результата, то используем ее
+			if (_this._reducer) {
+				return _this._reducer({
+					result: res,
+					target: target
+				});
+			}
+
+			// Иначе, просто сливаем код
+			return _.map(res, 'code').join(EOL);
+		});
+	})
+	.createTech();
